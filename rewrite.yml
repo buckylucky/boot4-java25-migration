@@ -1,0 +1,899 @@
+# Spring Boot 2.6 -> 4.1 / Java 25 migration - composite OpenRewrite recipe
+#
+# Usage: see SKILL.md > Phase 2-a. One command, one pass.
+# For items NOT covered, see SKILL.md > "OUTSIDE RECIPE SCOPE".
+#
+# Provenance: built during a real 85-service fleet migration. The backbone is
+# OpenRewrite's official Boot 3.5 chain; everything below it exists because the
+# official chain either misses it or does it wrong for this target (each step is
+# annotated). Validated end to end with dryRun on real services.
+#
+# CRITICAL FIELD LESSON: never run with -U. Combined with unreachable external
+# repositories it silently breaks resolution and type-based steps are SKIPPED
+# with a green build (measured: 2 files changed with -U, 23 without, same repo).
+# Always inspect `git diff --stat` after the run.
+#
+# ============================ DELIBERATELY UNUSED RECIPES ============================
+# Do not add these to the chain:
+#
+# 1) org.openrewrite.java.spring.boot4.UpgradeSpringBoot_4_0
+#    Contains UpgradeSpringFramework_7_0, which contains UpgradeJackson_2_3: converts
+#    ALL com.fasterxml.jackson usage to tools.jackson (Jackson 3). Our strategic
+#    decision is "stay on Jackson 2 for the wire", so this recipe is unusable; the
+#    chain is opened up by hand below. It also pins the parent to 4.0.x (target is
+#    4.1.x) and renames spring-boot-starter-web to starter-webmvc.
+#
+# 2) org.openrewrite.java.spring.framework.UpgradeSpringFramework_7_0
+#    Same Jackson 3 reason, plus MigrateFromSpringFrameworkAnnotations rewrites
+#    @Nullable in every file (huge diff; JSpecify is a separate phase).
+#
+# 3) org.openrewrite.java.migrate.UpgradeToJava25
+#    Contains two destructive recipes:
+#      - MigrateMainMethodToInstanceMain: turns `public static void main(String[])`
+#        into an instance `void main()`; the Spring Boot launcher looks for a static
+#        main -> THE APPLICATION NO LONGER STARTS.
+#      - ReplaceSystemOutWithIOPrint: compiles, but bloats the migration diff.
+#    The safe subset is listed one by one below.
+#
+# 4) org.openrewrite.java.spring.boot3.MaintainTrailingSlashURLMappings
+#    Injects `configurer.setUseTrailingSlashMatch(true)` into WebMvcConfigurer; that
+#    method was REMOVED in Spring Framework 7 -> produces non-compiling code. Use the
+#    UrlHandlerFilter approach in SKILL.md instead.
+#
+# 5) org.openrewrite.java.spring.cloud2025.UpgradeSpringCloud_2025_1
+#    Rewrites the parent pom to Boot 4.0.x -> conflicts with the 4.1 target.
+#    The spring-cloud.version property is set by hand below.
+#
+# 6) org.openrewrite.java.springdoc.UpgradeSpringDoc_3_0
+#    Pins springdoc to 3.0.x, which on Boot 4.1 produces exactly the
+#    "No operations defined in spec!" failure. Bumped to 3.1.x below.
+# =====================================================================================
+---
+type: specs.openrewrite.org/v1beta/recipe
+name: org.boot4migration.Boot4Java25Upgrade
+displayName: Spring Boot 4.1 / Java 25 upgrade
+description: >-
+  The deterministic part of a Spring Boot 2.6 + Java 17 -> Boot 4.1 + Java 25 migration.
+  OpenRewrite's official Boot/Security/Hibernate/Framework chains plus fixes for known
+  gaps, learned on a real fleet. Stays on Jackson 2 for the wire (Jackson 3 is a
+  separate phase).
+tags:
+  - boot4
+  - java25
+recipeList:
+
+  # ================================================================================
+  # 1) BACKBONE: OpenRewrite's official Boot 3.5 chain
+  # ================================================================================
+  # One line; verified contents (read from the rewrite-spring jar):
+  #   boot2.UpgradeSpringBoot_2_7        -> JUnit4->Jupiter, obsolete runners
+  #   migrate.UpgradeToJava17            -> text blocks / instanceof patterns / plugin bumps
+  #   migrate.jakarta.JakartaEE10        -> javax.* -> jakarta.* (correct scope)
+  #   boot3.RemoveConstructorBindingAnnotation
+  #   boot2.MoveAutoConfigurationToImportsFile
+  #   boot3.ActuatorEndpointSanitization, boot3.MigrateMaxHttpHeaderSize
+  #   boot2/3.SpringBootProperties_2_0 .. _3_5  -> ~660 property keys (application.yml!)
+  #   security5/6 chains                 -> WebSecurityConfigurerAdapter, matchers, lambda DSL
+  #   framework.UpgradeSpringFramework_6_1/6_2
+  #   hibernate.MigrateToHibernate62
+  #   apache.httpclient5.UpgradeApacheHttpClient_5   -> HC4 -> HC5 (no manual work!)
+  #   apache.commons.lang.UpgradeApacheCommonsLang_2_3
+  #   testing.mockito.Mockito4to5Only
+  #   springdoc.UpgradeSpringDoc_2_x, micrometer.UpgradeMicrometer_1_13
+  #   spring.data.UpgradeSpringData_3_4, cloud2024/2025 chains
+  #   spring.kafka.UpgradeSpringKafka_3_0 -> send() return type, .completable() removal,
+  #                                          KafkaHeaders constant renames
+  - org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_5
+
+  # ================================================================================
+  # 2) FRAMEWORK 7 + SECURITY 7 + JUNIT 6  (while EXCLUDING Jackson 3)
+  # ================================================================================
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.springframework
+      artifactId: "*"
+      newVersion: 7.0.x
+  - org.openrewrite.java.spring.security7.UpgradeSpringSecurity_7_0
+  # The Boot 4.1 BOM manages JUnit 6; JUnit 5 API packages/names changed.
+  - org.openrewrite.java.testing.junit6.JUnit5to6Migration
+  # Individual fixes the 6.x chain may have left behind (no-op when already applied):
+  - org.openrewrite.java.spring.framework.MigrateResponseStatusException
+  - org.openrewrite.java.spring.framework.UseObjectUtilsIsEmpty
+
+  # ================================================================================
+  # 3) BOOT 4 CORE
+  # ================================================================================
+  # Boot 4.0 property renames (77 keys). The ones that matter most on a typical stack:
+  #   server.error.*                -> spring.web.error.*
+  #   server.servlet.encoding.*     -> spring.servlet.encoding.*
+  #   spring.jackson.read/write     -> spring.jackson.json.read/write
+  #   management.tracing.enabled    -> management.tracing.export.enabled
+  #   management.zipkin.tracing.*   -> management.tracing.export.zipkin.*
+  #   spring.http.client.*          -> spring.http.clients.*
+  - org.openrewrite.java.spring.boot4.SpringBootProperties_4_0
+  # Boot 4.1 property renames (verified in the rewrite-spring 6.37+ jar)
+  - org.openrewrite.java.spring.boot4.SpringBootProperties_4_1
+  # @MockBean/@SpyBean -> @MockitoBean/@MockitoSpyBean (+ answer->answers, attr removal)
+  - org.openrewrite.java.spring.boot4.ReplaceMockBeanAndSpyBean
+  # Boot 4 modularization: autoconfigure package moves (28 ChangePackage steps) plus
+  # usage-based module starters (webmvc-test, restclient, jdbc-test...).
+  # NOTE: the spring-boot-starter-web -> starter-webmvc rename is NOT in this recipe
+  # (it lives in UpgradeSpringBoot_4_0); old starter names are preserved by decision.
+  # NOTE: it DOES convert spring-kafka -> spring-boot-starter-kafka and
+  # spring-security-test -> spring-boot-starter-security-test (correct for Boot 4).
+  - org.openrewrite.java.spring.boot4.MigrateToModularStarters
+  # Hibernate 6.2 -> 7.1 (including Session.save/delete/get/load renames)
+  - org.openrewrite.hibernate.MigrateToHibernate71
+
+  # ================================================================================
+  # 4) VERSION TARGET: 4.1.x  (the chain stops at 3.5.x)
+  # ================================================================================
+  # Order matters: parent/plugin/dependency bumps must come AFTER the chain.
+  - org.openrewrite.maven.UpgradeParentVersion:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-starter-parent
+      newVersion: 4.1.x
+  - org.openrewrite.maven.UpgradePluginVersion:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-maven-plugin
+      newVersion: 4.1.x
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.springframework.boot
+      artifactId: "*"
+      newVersion: 4.1.x
+      overrideManagedVersion: false
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-dependencies
+      newVersion: 4.1.x
+      overrideManagedVersion: true
+  # Spring Cloud: the chain lands on 2025.0.x; the target is Oakwood 2025.1.x
+  # (2025.0.x does NOT work with Boot 4.1). Do not assume every pom already imports the
+  # spring-cloud-dependencies BOM: guarantee the import first (no-op when present),
+  # then pin the property and clean redundant version tags.
+  - org.openrewrite.maven.AddProperty:
+      key: spring-cloud.version
+      value: 2025.1.2
+  - org.openrewrite.maven.AddManagedDependency:
+      groupId: org.springframework.cloud
+      artifactId: spring-cloud-dependencies
+      version: ${spring-cloud.version}
+      type: pom
+      scope: import
+  - org.openrewrite.maven.ChangePropertyValue:
+      key: spring-cloud.version
+      newValue: 2025.1.2
+  # A Boot2-era hand-pinned spring-cloud starter version can clash with the new BOM and
+  # break resolution in the recipe's early steps; clean it early, before section 15.
+  - org.openrewrite.maven.RemoveRedundantDependencyVersions:
+      groupPattern: org.springframework.cloud
+      artifactPattern: spring-cloud-starter-bus-kafka
+      onlyIfManagedVersionIs: ANY
+
+  # ================================================================================
+  # 5) JAVA 25  (the SAFE subset of UpgradeToJava25 - see header WARNING 3)
+  # ================================================================================
+  # Rewrites <java.version> and maven.compiler.source/target/release to 25.
+  # Must come after the chain's UpgradeToJava17.
+  - org.openrewrite.java.migrate.UpgradeJavaVersion:
+      version: 25
+  # JEP 486: Security Manager permanently disabled (JDK 24+). Calls throw UOE.
+  - org.openrewrite.java.migrate.AccessController
+  - org.openrewrite.java.migrate.RemoveSecurityPolicy
+  - org.openrewrite.java.migrate.RemoveSecurityManager
+  - org.openrewrite.java.migrate.SystemGetSecurityManagerToNull
+  # APIs removed/changed since JDK 18
+  - org.openrewrite.java.migrate.lang.ThreadStopUnsupported
+  - org.openrewrite.java.migrate.DeleteDeprecatedFinalize
+  - org.openrewrite.java.migrate.RemovedSubjectMethods
+  - org.openrewrite.java.migrate.MigrateZipErrorToZipException
+  - org.openrewrite.java.migrate.util.MigrateInflaterDeflaterToClose
+  - org.openrewrite.java.migrate.lang.MigrateProcessWaitForDuration
+  - org.openrewrite.java.migrate.net.URLConstructorToURICreate
+  - org.openrewrite.staticanalysis.ReplaceDeprecatedRuntimeExecMethods
+  # Java-21-capable plugin baseline (surefire/compiler/jacoco). Exact JDK 25 pins
+  # follow explicitly in section 8; this line only raises the floor.
+  - org.openrewrite.java.migrate.UpgradePluginsForJava21
+
+  # ================================================================================
+  # 6) BOOT 4 PACKAGE MOVES missing from the OSS catalog (must stay hand-written)
+  # ================================================================================
+  # These are NOT in MigrateToModularStarters' ChangePackage list (the rewrite-spring
+  # jar was scanned entry by entry). If a future chain version adds them, these steps
+  # become no-ops; leaving them is safe.
+  #
+  # Redis: both the package AND the class name changed
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      newFullyQualifiedTypeName: org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+      newFullyQualifiedTypeName: org.springframework.boot.data.redis.autoconfigure.DataRedisRepositoriesAutoConfiguration
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.springframework.boot.autoconfigure.data.redis
+      newPackageName: org.springframework.boot.data.redis.autoconfigure
+      recursive: true
+  # Actuator health moved to the spring-boot-health module
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.springframework.boot.actuate.health
+      newPackageName: org.springframework.boot.health.contributor
+      recursive: true
+  # Embedded web server classes
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.springframework.boot.web.embedded.tomcat
+      newPackageName: org.springframework.boot.tomcat
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.springframework.boot.web.servlet.server
+      newPackageName: org.springframework.boot.web.server.servlet
+      recursive: true
+
+  # ================================================================================
+  # 7) HIBERNATE 7: @Where -> @SQLRestriction  (NOT in the OSS catalog)
+  # ================================================================================
+  # Two steps are required: first the type, then the attribute name (clause -> value),
+  # or the result does not compile.
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.hibernate.annotations.Where
+      newFullyQualifiedTypeName: org.hibernate.annotations.SQLRestriction
+  - org.openrewrite.java.ChangeAnnotationAttributeName:
+      annotationType: org.hibernate.annotations.SQLRestriction
+      oldAttributeName: clause
+      newAttributeName: value
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.hibernate.annotations.WhereJoinTable
+      newFullyQualifiedTypeName: org.hibernate.annotations.SQLJoinTableRestriction
+  - org.openrewrite.java.ChangeAnnotationAttributeName:
+      annotationType: org.hibernate.annotations.SQLJoinTableRestriction
+      oldAttributeName: clause
+      newAttributeName: value
+
+  # ================================================================================
+  # 8) BUILD: mandatory pom changes for JDK 25
+  # ================================================================================
+  # Lombok annotation processor: JDK 23+ disabled implicit processor discovery from the
+  # classpath. WITHOUT this step Lombok does not run at all (the same pom compiles on
+  # JDK 17, which misleads). AddAnnotationProcessor adds to annotationProcessorPaths.
+  - org.openrewrite.maven.AddAnnotationProcessor:
+      groupId: org.projectlombok
+      artifactId: lombok
+      version: ${lombok.version}
+  # For MapStruct users: once annotationProcessorPaths exists, ONLY listed processors
+  # run -> mapper impls are silently not generated without these. The property is
+  # guaranteed first (an existing value is NOT changed), then referenced; the processor
+  # version must equal the mapstruct dependency version.
+  - org.openrewrite.maven.AddProperty:
+      key: org.mapstruct.version
+      value: 1.6.3
+      preserveExistingValue: true
+  - org.openrewrite.maven.AddAnnotationProcessor:
+      groupId: org.mapstruct
+      artifactId: mapstruct-processor
+      version: ${org.mapstruct.version}
+  - org.openrewrite.maven.AddAnnotationProcessor:
+      groupId: org.projectlombok
+      artifactId: lombok-mapstruct-binding
+      version: 0.2.0
+  # JaCoCo: below 0.8.14 it cannot read Java 25 bytecode (class file 69).
+  - org.openrewrite.maven.UpgradePluginVersion:
+      groupId: org.jacoco
+      artifactId: jacoco-maven-plugin
+      newVersion: 0.8.14
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.jacoco
+      artifactId: "*"
+      newVersion: 0.8.14
+  # Surefire: 2.22.x SILENTLY runs zero JUnit 6 tests (green build).
+  - org.openrewrite.maven.UpgradePluginVersion:
+      groupId: org.apache.maven.plugins
+      artifactId: maven-surefire-plugin
+      newVersion: 3.5.x
+  - org.openrewrite.maven.UpgradePluginVersion:
+      groupId: org.apache.maven.plugins
+      artifactId: maven-failsafe-plugin
+      newVersion: 3.5.x
+  # maven-compiler-plugin: 3.14.1 and older die on JDK 25.
+  - org.openrewrite.maven.UpgradePluginVersion:
+      groupId: org.apache.maven.plugins
+      artifactId: maven-compiler-plugin
+      newVersion: 3.14.2
+  # Spring Framework 7 requires parameter name info (-parameters). The Boot parent
+  # enables it, but it can vanish when annotationProcessorPaths is added or the parent
+  # is absent -> guarantee via property. Missing it fails @RequestParam/@PathVariable,
+  # @ConfigurationProperties constructor binding and derived queries at RUNTIME.
+  - org.openrewrite.maven.AddProperty:
+      key: maven.compiler.parameters
+      value: "true"
+      preserveExistingValue: true
+  # byte-buddy: UpgradePluginsForJava21 pins 1.14.11 (far too old for JDK 25); below
+  # 1.17.5 Mockito AND the Hibernate bytecode enhancer fail together. This step comes
+  # after the chain, so it wins. Best is no pin at all (the Boot 4.1 BOM manages
+  # 1.18.x); RemoveRedundantDependencyVersions below deletes BOM-managed tags.
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: net.bytebuddy
+      artifactId: "*"
+      newVersion: 1.18.x
+  # ASM-based Maven plugins (shade, jacoco, enforcer...) below 9.8:
+  # "Unsupported class file major version 69".
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.ow2.asm
+      artifactId: "*"
+      newVersion: 9.8
+  # Lombok floor for JDK 25 is 1.18.40; 1.18.44+ avoids phantom "val" compile errors.
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.projectlombok
+      artifactId: lombok
+      newVersion: 1.18.44
+  # Apache CXF (JAX-WS/SOAP services): 3.5.x is javax-based and does not run on Boot 4;
+  # 4.1.x is the Boot 3 line. 4.2.x compiles against Spring Framework 7 / Boot 4.1
+  # (verified from the cxf-parent pom).
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.apache.cxf
+      artifactId: "*"
+      newVersion: 4.2.3
+  # Hibernate 7: the static metamodel processor was renamed. On the old name the
+  # Entity_ classes are SILENTLY not generated.
+  - org.openrewrite.java.dependencies.ChangeDependency:
+      oldGroupId: org.hibernate.orm
+      oldArtifactId: hibernate-jpamodelgen
+      newArtifactId: hibernate-processor
+  - org.openrewrite.java.dependencies.ChangeDependency:
+      oldGroupId: org.hibernate
+      oldArtifactId: hibernate-jpamodelgen
+      newGroupId: org.hibernate.orm
+      newArtifactId: hibernate-processor
+
+  # ================================================================================
+  # 9) DEPENDENCIES TO REMOVE
+  # ================================================================================
+  # AOP: spring-boot-starter-aop was removed in Boot 4. The official path is
+  # spring-boot-starter-aspectj (BOM-managed).
+  - org.openrewrite.java.dependencies.ChangeDependency:
+      oldGroupId: org.springframework.boot
+      oldArtifactId: spring-boot-starter-aop
+      newGroupId: org.springframework.boot
+      newArtifactId: spring-boot-starter-aspectj
+  # NPEs on empty-prefix @ConfigurationProperties(""); metadata is IDE-only anyway.
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-configuration-processor
+  # The old javax JAX-WS runtime ("rt" is jaxws-rt's javax-era artifact name); the
+  # jakarta counterpart jaxws-rt 4.x arrives anyway. If it stays it leaks
+  # javax.xml.ws/javax.jws into dependency:tree.
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: com.sun.xml.ws
+      artifactId: rt
+  # Sleuth ended with Boot 3 -> micrometer tracing (added below)
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.springframework.cloud
+      artifactId: spring-cloud-starter-sleuth
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: io.zipkin.brave
+      artifactId: brave
+  # POLICY STEP (adapt): if your shared library carries spring-cloud-starter-config,
+  # services get it transitively and the explicit declaration can go. CAREFUL: in a
+  # repo that does NOT depend on the shared library, REMOVE THIS STEP (it happened in
+  # the field: deleting starter-config loses the config client and @RefreshScope).
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.springframework.cloud
+      artifactId: spring-cloud-starter-config
+  # Field case (/v3/api-docs 500 - NoSuchMethodError Info.summary): an OLD
+  # swagger-annotations 2.1.x arriving from a Kafka/Avro serializer chain carries the
+  # SAME package as springdoc's swagger-annotations-jakarta; which class loads is jar
+  # order luck. Exclude the old one.
+  - org.openrewrite.maven.ExcludeDependency:
+      groupId: io.swagger.core.v3
+      artifactId: swagger-annotations
+  # Mockito 5: inline is the default; the artifact ended at 5.2
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.mockito
+      artifactId: mockito-inline
+  # jakarta validation arrives with the starter
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: javax.validation
+      artifactId: validation-api
+  # Axis 1.4: usually present only for TeeOutputStream; host a local copy instead
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.apache.axis
+      artifactId: axis
+  # commons-lang 2.x is dead; lang3 policy: carry it in the shared library only
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: commons-lang
+      artifactId: commons-lang
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: javax.xml.bind
+      artifactId: jaxb-api
+  # Dead project; breaks on Boot 4
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: com.internetitem
+      artifactId: logback-elasticsearch-appender
+  # Boot 4 no longer packages <optional>true</optional> deps into the uber-jar;
+  # devtools should not be in a prod image anyway.
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-devtools
+
+  # ================================================================================
+  # 10) DEPENDENCIES TO ADD / CHANGE
+  # ================================================================================
+  # EXAMPLE (adapt to your shared libraries): bump your platform library to its Boot 4
+  # release line; the old line stays frozen for Boot 2 services.
+  # - org.openrewrite.maven.UpgradeDependencyVersion:
+  #     groupId: com.yourcompany
+  #     artifactId: core-util
+  #     newVersion: 1.0.1
+  #
+  # Micrometer Tracing replaces Sleuth.
+  # CAREFUL: Micrometer TRACING's version line differs from micrometer-core
+  # (core 1.16.x vs tracing 1.7.x on Boot 4.1); writing the core version fails
+  # resolution. The version tag is handed to the BOM by the cleanup step below.
+  - org.openrewrite.java.dependencies.AddDependency:
+      groupId: io.micrometer
+      artifactId: micrometer-tracing-bridge-brave
+      version: 1.7.x
+      onlyIfUsing: org.springframework.web.bind.annotation.*
+      acceptTransitive: true
+  # Oracle JDBC: decade-old ojdbc6/ojdbc8 drivers are unsupported on JDK 25 and their
+  # DATE/TIMESTAMP conversions differ (see SKILL.md > "Oracle date format").
+  # Target: a current ojdbc11 line, PINNED (the BOM may manage a different line).
+  # Skip this whole block if you are not on Oracle.
+  - org.openrewrite.maven.ChangeDependencyGroupIdAndArtifactId:
+      oldGroupId: com.oracle
+      oldArtifactId: ojdbc6
+      newGroupId: com.oracle.database.jdbc
+      newArtifactId: ojdbc11
+      newVersion: 23.7.0.25.01
+  - org.openrewrite.maven.ChangeDependencyGroupIdAndArtifactId:
+      oldGroupId: com.oracle.database.jdbc
+      oldArtifactId: ojdbc8
+      newGroupId: com.oracle.database.jdbc
+      newArtifactId: ojdbc11
+      newVersion: 23.7.0.25.01
+  # orai18n (NLS / character sets) must match the ojdbc version exactly
+  - org.openrewrite.maven.ChangeDependencyGroupIdAndArtifactId:
+      oldGroupId: com.oracle.ojdbc
+      oldArtifactId: orai18n
+      newGroupId: com.oracle.database.nls
+      newArtifactId: orai18n
+      newVersion: 23.7.0.25.01
+  # Oracle drivers after 11.2 REQUIRE orai18n on the classpath for non-ISO-8859-1
+  # database character sets; without it:
+  # "SQLException: Non supported character set (add orai18n.jar in your classpath)".
+  # Mandatory for single-byte national charsets (e.g. WE8ISO8859P9).
+  - org.openrewrite.java.dependencies.AddDependency:
+      groupId: com.oracle.database.nls
+      artifactId: orai18n
+      version: 23.7.0.25.01
+      onlyIfUsing: org.springframework.data.jpa.repository.*
+      acceptTransitive: true
+  # The Boot 4 BOM manages org.hibernate.orm, not org.hibernate
+  - org.openrewrite.maven.ChangeDependencyGroupIdAndArtifactId:
+      oldGroupId: org.hibernate
+      oldArtifactId: hibernate-core
+      newGroupId: org.hibernate.orm
+      newArtifactId: hibernate-core
+  # Bare spring-data-jpa/hibernate-core/jakarta.persistence-api -> the starter
+  # (otherwise it COMPILES but repository beans are never created; dies at startup)
+  - org.openrewrite.java.dependencies.AddDependency:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-starter-data-jpa
+      version: 4.1.x
+      onlyIfUsing: org.springframework.data.jpa.repository.*
+      acceptTransitive: true
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: org.springframework.data
+      artifactId: spring-data-jpa
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: jakarta.persistence
+      artifactId: jakarta.persistence-api
+  # springdoc: the Boot 4.1 alignment is 3.1.x (fixes "No operations defined in spec!").
+  # Must come after the chain's springdoc steps.
+  - org.openrewrite.java.dependencies.ChangeDependency:
+      oldGroupId: org.springdoc
+      oldArtifactId: springdoc-openapi-ui
+      newGroupId: org.springdoc
+      newArtifactId: springdoc-openapi-starter-webmvc-ui
+      newVersion: 3.1.0
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.springdoc
+      artifactId: "*"
+      newVersion: 3.1.x
+  # BouncyCastle no longer arrives transitively
+  - org.openrewrite.java.dependencies.AddDependency:
+      groupId: org.bouncycastle
+      artifactId: bcprov-jdk18on
+      version: 1.81
+      onlyIfUsing: org.bouncycastle..*
+      acceptTransitive: true
+  - org.openrewrite.java.dependencies.AddDependency:
+      groupId: org.bouncycastle
+      artifactId: bcpkix-jdk18on
+      version: 1.81
+      onlyIfUsing: org.bouncycastle.cert..*
+      scope: test
+      acceptTransitive: true
+  # Logback 1.5 alignment
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: net.logstash.logback
+      artifactId: logstash-logback-encoder
+      newVersion: 8.1
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.apache.poi
+      artifactId: "*"
+      newVersion: 5.4.1
+  # CAREFUL: guava/modelmapper pins must come AFTER the chain's UpgradePluginsForJava21
+  # (which "upgrades" guava to 29.0 and modelmapper to an old 3.2.x).
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: com.google.guava
+      artifactId: guava
+      newVersion: 33.4.8-jre
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.modelmapper
+      artifactId: modelmapper
+      newVersion: 3.2.4
+  # A Confluent platform pin is DELIBERATELY absent: Confluent 7.x targets old Kafka
+  # and Avro lines while Boot 4.1 manages kafka-clients 4.x; the Kafka-4 alignment is
+  # Confluent 8.x. Learn the exact mirrored version from your artifact proxy and add
+  # the pin yourself (Confluent artifacts are NOT on Central):
+  # - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+  #     groupId: io.confluent
+  #     artifactId: "*"
+  #     newVersion: 8.x
+  - org.openrewrite.java.dependencies.UpgradeDependencyVersion:
+      groupId: org.springframework.retry
+      artifactId: spring-retry
+      newVersion: 2.0.12
+  # The Avro RUNTIME version is never pinned independently (the serializer's pom must
+  # decide, or serde mismatches follow). Only the code-GENERATING plugin is raised to
+  # the CVE floor (code-injection CVE below 1.12.1 / 1.11.5).
+  - org.openrewrite.maven.UpgradePluginVersion:
+      groupId: org.apache.avro
+      artifactId: avro-maven-plugin
+      newVersion: 1.12.x
+
+  # ================================================================================
+  # 11) CODE: type moves the official chain misses
+  # ================================================================================
+  # Axis's StringUtils -> lang3
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.apache.axis.utils.StringUtils
+      newFullyQualifiedTypeName: org.apache.commons.lang3.StringUtils
+  # commons-lang3 shaded INSIDE logstash-logback-encoder 6.x (an IDE auto-import
+  # accident); encoder 8.x has no shading -> convert to real lang3
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: net.logstash.logback.encoder.org.apache.commons.lang3
+      newPackageName: org.apache.commons.lang3
+      recursive: true
+  # guava Preconditions shaded INSIDE jersey (same accident class; jersey used to
+  # arrive as a transitive of the old javax JAX-WS runtime) -> real guava (behavior
+  # identical: checkArgument=IllegalArgumentException, checkNotNull=NPE). If the repo
+  # has no guava, fix by hand (see SKILL.md); do NOT convert to an in-house
+  # Preconditions class that throws a different exception type.
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.glassfish.jersey.internal.guava.Preconditions
+      newFullyQualifiedTypeName: com.google.common.base.Preconditions
+  # Jackson 1.x leftovers (transitive from old Avro) -> Jackson 2
+  #
+  # CAREFUL - do NOT use a blanket `ChangePackage: org.codehaus.jackson ->
+  # com.fasterxml.jackson`. Jackson 1->2 is NOT a flat root rename; subpackages were
+  # reorganized and the blanket rule produces NONEXISTENT packages (field case:
+  # annotate.JsonIgnore -> the correct target is jackson.annotation).
+  # Rules are ordered SPECIFIC to GENERAL; keep the order (recipes apply in
+  # declaration order; the root rule is last with recursive:false).
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.annotate
+      newPackageName: com.fasterxml.jackson.annotation
+      recursive: true
+  # map.annotate must precede the map rule (else it produces .databind.annotate)
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.map.annotate
+      newPackageName: com.fasterxml.jackson.databind.annotation
+      recursive: true
+  # type.JavaType lives in databind, not core.type (must precede the type rule)
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.codehaus.jackson.type.JavaType
+      newFullyQualifiedTypeName: com.fasterxml.jackson.databind.JavaType
+  # JsonNode: root package in Jackson 1, databind in Jackson 2 (before the root rule)
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.codehaus.jackson.JsonNode
+      newFullyQualifiedTypeName: com.fasterxml.jackson.databind.JsonNode
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.map
+      newPackageName: com.fasterxml.jackson.databind
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.node
+      newPackageName: com.fasterxml.jackson.databind.node
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.schema
+      newPackageName: com.fasterxml.jackson.databind.jsonschema
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.type
+      newPackageName: com.fasterxml.jackson.core.type
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.impl
+      newPackageName: com.fasterxml.jackson.core.json
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.format
+      newPackageName: com.fasterxml.jackson.core.format
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.io
+      newPackageName: com.fasterxml.jackson.core.io
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.sym
+      newPackageName: com.fasterxml.jackson.core.sym
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.util
+      newPackageName: com.fasterxml.jackson.core.util
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.xc
+      newPackageName: com.fasterxml.jackson.module.jaxb
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.mrbean
+      newPackageName: com.fasterxml.jackson.module.mrbean
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.smile
+      newPackageName: com.fasterxml.jackson.dataformat.smile
+      recursive: true
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson.jaxrs
+      newPackageName: com.fasterxml.jackson.jaxrs.json
+      recursive: true
+  # THE REST of the root package -> core (JsonParser, JsonGenerator, JsonFactory,
+  # JsonToken, JsonProcessingException, ObjectCodec...). JsonNode and the subpackages
+  # were handled above; hence recursive:false and LAST.
+  - org.openrewrite.java.ChangePackage:
+      oldPackageName: org.codehaus.jackson
+      newPackageName: com.fasterxml.jackson.core
+      recursive: false
+  # POI 5: getCellTypeEnum removed
+  - org.openrewrite.java.ChangeMethodName:
+      methodPattern: org.apache.poi.ss.usermodel.Cell getCellTypeEnum()
+      newMethodName: getCellType
+  # javax.ws.rs exceptions -> Spring-native ResponseStatusException.
+  # (Do NOT add jakarta.ws.rs-api: it looks up a RuntimeDelegate provider at runtime
+  # and dies.) The TYPE change is automatic; adding HttpStatus to the constructor
+  # arguments is MANUAL (see SKILL.md).
+  #
+  # CAREFUL: these rules match the javax.* NAME only. The jakarta step also renames
+  # javax.ws.rs to jakarta.ws.rs, so any JAX-RS exception NOT listed here survives as
+  # `package jakarta.ws.rs does not exist` at compile time. Add new types as found.
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.InternalServerErrorException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.BadRequestException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.NotFoundException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.NotAuthorizedException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.ForbiddenException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.NotAcceptableException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.NotAllowedException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.ServiceUnavailableException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.ClientErrorException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.ServerErrorException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: javax.ws.rs.WebApplicationException
+      newFullyQualifiedTypeName: org.springframework.web.server.ResponseStatusException
+
+  # ================================================================================
+  # 13) CONFIG COMPATIBILITY BLOCK - pin Hibernate 7 / Oracle date behavior
+  # ================================================================================
+  # Without this step the service COMPILES, tests PASS, but dates coming out of the
+  # database and id generation change (see SKILL.md > "Oracle date format" and
+  # "ORA-02289"). Everything here restores Hibernate 5 semantics; none of it needs
+  # DDL or data migration.
+  #   - native query results return java.sql (Timestamp) instead of java.time
+  #   - Instant fields do not drift to TIMESTAMP WITH TIME ZONE
+  #   - timezone is normalized (Hibernate 5 behavior) - PIN THE JVM ZONE (see SKILL.md)
+  #   - implicit sequence naming stays hibernate_sequence
+  # If your config lives in a Config Server backend (DB/vault), this step only fixes
+  # the repo's application.yml; add the same keys there as service+profile rows.
+  # NOTE: the key targets $.spring (not a deep root) so the block nests inside the
+  # existing "spring:" tree instead of producing a sibling flat key. Measured on real
+  # multi-document application.yml files; values are identical so the repetition per
+  # document is harmless. NEVER put comment lines inside the yaml snippet; MergeYaml
+  # glues them onto the previous line and produces a broken scalar (measured).
+  - org.openrewrite.yaml.MergeYaml:
+      key: $.spring
+      createNewKeys: true
+      filePattern: "**/application*.yml"
+      yaml: |-
+        jpa:
+          properties:
+            hibernate.query.native.prefer_jdbc_datetime_types: true
+            hibernate.type.preferred_instant_jdbc_type: TIMESTAMP
+            hibernate.timezone.default_storage: NORMALIZE
+            hibernate.id.db_structure_naming_strategy: legacy
+  # Pin CHANGED Boot 4 defaults back to Boot 2.6 semantics. Every line here PRESERVES
+  # behavior; deliberate improvements (open-in-view=false, connection-fetch=lazy) are
+  # NOT added here - adopt them consciously per service (see SKILL.md).
+  # server.shutdown: Boot 4 default is "graceful" (2.6 was "immediate"); 30 s drain per
+  # pod locks rollouts. If you adopt graceful, also apply the deployment-side settings.
+  # max-parameter-count: Tomcat 11 dropped the default to 1000 AND now throws where
+  # Tomcat 9 silently truncated. Restore the old limit.
+  - org.openrewrite.yaml.MergeYaml:
+      key: $.server
+      createNewKeys: true
+      filePattern: "**/application*.yml"
+      yaml: |-
+        shutdown: immediate
+        tomcat:
+          max-parameter-count: 10000
+  # spring.jackson.find-and-add-modules became true in Boot 4 -> EVERY Jackson module
+  # on the classpath registers and response JSON changes silently. Keep it off for the
+  # duration of the wave.
+  - org.openrewrite.yaml.MergeYaml:
+      key: $.spring
+      createNewKeys: true
+      filePattern: "**/application*.yml"
+      yaml: |-
+        jackson:
+          find-and-add-modules: false
+  # validate-group-membership: the true default KILLS STARTUP when a health group
+  # names a missing indicator. Re-enable per service once group lists are fixed.
+  - org.openrewrite.yaml.MergeYaml:
+      key: $.management
+      createNewKeys: true
+      filePattern: "**/application*.yml"
+      yaml: |-
+        endpoint:
+          health:
+            validate-group-membership: false
+  # management.health.probes.enabled was RENAMED (-> management.endpoint.health
+  # .probes.enabled) with a true default. The old key is silently ignored -> delete.
+  - org.openrewrite.yaml.DeleteKey:
+      keyPath: $.management.health.probes.enabled
+      filePattern: "**/application*.yml"
+  # Version-specific Oracle dialect classes were DELETED in Hibernate 6. Best is not
+  # setting a dialect at all (detected from JDBC metadata). These two steps fix repo
+  # yml only; if the value lives in your config store, prefer a normalizing
+  # EnvironmentPostProcessor in your shared library (see SKILL.md) over DB edits.
+  - org.openrewrite.yaml.DeleteKey:
+      keyPath: $.spring.jpa.database-platform
+      filePattern: "**/application*.yml"
+  - org.openrewrite.yaml.DeleteKey:
+      keyPath: $.spring.jpa.properties.hibernate.dialect
+      filePattern: "**/application*.yml"
+
+  # ================================================================================
+  # 14) IMPLEMENTING THE "STAY ON JACKSON 2" DECISION
+  # ================================================================================
+  # STRATEGIC DECISION: the wire format stays Jackson 2 (Jackson 3 is its own phase).
+  # COMMON FALSE BELIEF: defining a com.fasterxml ObjectMapper @Bean is NOT enough.
+  # Boot 4 auto-configures tools.jackson's JsonMapper as @Primary and the HTTP message
+  # converter reads THAT; the ObjectMapper bean only serves injection.
+  # The official way is the spring-boot-jackson2 module + the spring.jackson2.*
+  # namespace. EXPIRY: the module shipped deprecated in Boot 4.0 and WILL be removed
+  # in a later 4.x; check it still exists at every Boot minor bump.
+  # onlyIfUsing is deliberately NOT used: a typical DTO-returning controller touches
+  # no Jackson type, and conditional adoption leaves a fleet with TWO wire formats.
+  # The decision is per fleet, not per service.
+  - org.openrewrite.java.dependencies.AddDependency:
+      groupId: org.springframework.boot
+      artifactId: spring-boot-jackson2
+      version: 4.1.x
+      acceptTransitive: false
+  # CRITICAL: the dependency alone changes NOTHING. Only this key decides which
+  # Jackson the HTTP message converter uses. Without it the "stay on Jackson 2"
+  # decision never reaches the wire and every Jackson 3 default change hits you.
+  - org.openrewrite.yaml.MergeYaml:
+      key: $.spring
+      createNewKeys: true
+      filePattern: "**/application*.yml"
+      yaml: |-
+        http:
+          converters:
+            preferred-json-mapper: jackson2
+  # spring.jackson.use-jackson2-defaults is deliberately NOT added: it configures the
+  # JACKSON 3 mapper and is meaningless when the wire is Jackson 2 (and it had a
+  # FAIL_ON_UNKNOWN_PROPERTIES bug before Boot 4.0.6).
+  # These three modules are no longer needed on Boot 4, and left versionless they drag
+  # Jackson 2 back onto the classpath so both generations run side by side.
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: com.fasterxml.jackson.datatype
+      artifactId: jackson-datatype-jsr310
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: com.fasterxml.jackson.datatype
+      artifactId: jackson-datatype-jdk8
+  - org.openrewrite.maven.RemoveDependency:
+      groupId: com.fasterxml.jackson.module
+      artifactId: jackson-module-parameter-names
+  # <jackson-bom.version> now pins Jackson 3; a leftover 2.x value produces the
+  # nonexistent coordinate tools.jackson:jackson-bom:2.x.
+  - org.openrewrite.maven.RemoveProperty:
+      propertyName: jackson-bom.version
+  # Spring Kafka 4: Jackson-based serializer classes renamed
+  - org.openrewrite.java.ChangeType:
+      oldFullyQualifiedTypeName: org.springframework.kafka.support.DefaultKafkaHeaderMapper
+      newFullyQualifiedTypeName: org.springframework.kafka.support.JsonKafkaHeaderMapper
+
+  # ================================================================================
+  # 15) FINAL CLEANUP
+  # ================================================================================
+  # Automation of the "never pin Jackson" ban: delete ALL version tags the BOM
+  # manages. A hand-pinned jackson-annotations breaks Jackson 3's static init and
+  # fails every test that builds a RestTemplate, in a cascade.
+  - org.openrewrite.maven.RemoveRedundantDependencyVersions:
+      onlyIfManagedVersionIs: ANY
+  - org.openrewrite.maven.RemoveDuplicateDependencies
+  # RemoveUnusedProperties is deliberately NOT used: it deletes properties added above
+  # on purpose (maven.compiler.parameters, org.mapstruct.version) - a self-defeating step.
+  # ---- PLAIN-TEXT STEPS LAST ----
+  # org.openrewrite.text.FindAndReplace converts the target file to plain text for the
+  # REST of the run; touch a yml with it first and later MergeYaml/DeleteKey steps DO
+  # NOT RUN on that file. Hence every yml-targeting FindAndReplace comes after the
+  # yaml steps. These two FQCNs moved in Boot 4; the old names fail with CNFE.
+  - org.openrewrite.text.FindAndReplace:
+      find: org.springframework.boot.orm.jpa.hibernate.SpringImplicitNamingStrategy
+      replace: org.springframework.boot.hibernate.SpringImplicitNamingStrategy
+      filePattern: "**/application*.yml"
+  - org.openrewrite.text.FindAndReplace:
+      find: org.springframework.boot.orm.jpa.hibernate.SpringPhysicalNamingStrategy
+      replace: org.springframework.boot.hibernate.SpringPhysicalNamingStrategy
+      filePattern: "**/application*.yml"
+  # EXAMPLE (adapt to your CI): bump the JDK path your Jenkinsfile points at.
+  - org.openrewrite.text.FindAndReplace:
+      find: /data/java/java17
+      replace: /data/java/java25
+      filePattern: "**/Jenkinsfile"
+  - org.openrewrite.text.FindAndReplace:
+      find: /data/java/java11
+      replace: /data/java/java25
+      filePattern: "**/Jenkinsfile"
+
+---
+# =====================================================================================
+# DIAGNOSTIC RECIPE - changes nothing, only reports.
+# Run AFTER the upgrade: `-Drewrite.activeRecipes=org.boot4migration.Boot4Java25Check`
+# =====================================================================================
+type: specs.openrewrite.org/v1beta/recipe
+name: org.boot4migration.Boot4Java25Check
+displayName: Boot 4 migration check (read-only)
+description: >-
+  Reports items left after the recipe run and type-attribution loss. Where type
+  attribution is lost, ChangeType/ChangeMethodName steps were SILENTLY skipped.
+recipeList:
+  # Type attribution loss: code transformations may not have run in these files
+  - org.openrewrite.java.search.FindMissingTypes
+  # Remaining javax
+  - org.openrewrite.java.search.FindTypes:
+      fullyQualifiedTypeName: javax.servlet.http.HttpServletRequest
+  - org.openrewrite.java.search.FindTypes:
+      fullyQualifiedTypeName: javax.persistence.Entity
+  # Annotations removed/changed in Hibernate 7
+  - org.openrewrite.java.search.FindAnnotations:
+      annotationPattern: "@org.hibernate.annotations.Type"
+  - org.openrewrite.java.search.FindAnnotations:
+      annotationPattern: "@org.hibernate.annotations.Where"
+  # StringUtils.isEmpty removed in Spring 6
+  - org.openrewrite.java.search.FindMethods:
+      methodPattern: org.springframework.util.StringUtils isEmpty(java.lang.Object)
+  # Trailing-slash risk: mappings whose final pattern ends in "/"
+  - org.openrewrite.java.search.FindAnnotations:
+      annotationPattern: "@org.springframework.web.bind.annotation.RequestMapping"
